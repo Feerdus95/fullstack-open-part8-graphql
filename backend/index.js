@@ -1,12 +1,65 @@
 const { ApolloServer } = require('@apollo/server')
-const { startStandaloneServer } = require('@apollo/server/standalone')
+const { expressMiddleware } = require('@apollo/server/express4')
+const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer')
+const { makeExecutableSchema } = require('@graphql-tools/schema')
+const express = require('express')
+const cors = require('cors')
+const http = require('http')
+const { WebSocketServer } = require('ws')
+const { useServer } = require('graphql-ws/lib/use/ws')
 const { GraphQLError } = require('graphql')
 const jwt = require('jsonwebtoken')
 const mongoose = require('mongoose')
 const Book = require('./models/book')
 const Author = require('./models/author')
 const User = require('./models/user')
+const { EventEmitter } = require('events')
 require('dotenv').config()
+
+const eventEmitter = new EventEmitter()
+const pubsub = {
+  publish(eventName, payload) {
+    eventEmitter.emit(eventName, payload)
+  },
+  asyncIterator(eventName) {
+    return {
+      [Symbol.asyncIterator]() {
+        const queue = []
+        const listeners = {
+          next: null,
+        }
+
+        eventEmitter.on(eventName, (payload) => {
+          if (listeners.next) {
+            listeners.next({ value: payload, done: false })
+            listeners.next = null
+          } else {
+            queue.push(payload)
+          }
+        })
+
+        return {
+          next() {
+            if (queue.length) {
+              return Promise.resolve({ value: queue.shift(), done: false })
+            }
+            return new Promise((resolve) => {
+              listeners.next = resolve
+            })
+          },
+          return() {
+            eventEmitter.removeAllListeners(eventName)
+            return Promise.resolve({ done: true })
+          },
+          throw(error) {
+            eventEmitter.removeAllListeners(eventName)
+            return Promise.reject(error)
+          },
+        }
+      },
+    }
+  },
+}
 
 const MONGODB_URI = process.env.MONGODB_URI
 const JWT_SECRET = process.env.JWT_SECRET
@@ -74,6 +127,10 @@ const typeDefs = `
       password: String!
     ): Token
   }
+
+  type Subscription {
+    bookAdded: Book!
+  }
 `
 
 const resolvers = {
@@ -109,7 +166,17 @@ const resolvers = {
     }
   },
   Mutation: {
-    addBook: async (root, args) => {
+    addBook: async (root, args, context) => {
+      const currentUser = context.currentUser
+
+      if (!currentUser) {
+        throw new GraphQLError('not authenticated', {
+          extensions: {
+            code: 'BAD_USER_INPUT',
+          }
+        })
+      }
+
       let author = await Author.findOne({ name: args.author })
 
       if (!author) {
@@ -131,6 +198,9 @@ const resolvers = {
 
       try {
         await book.save()
+        const savedBook = await Book.findById(book._id).populate('author')
+        pubsub.publish('BOOK_ADDED', { bookAdded: savedBook })
+        return savedBook
       } catch (error) {
         throw new GraphQLError('Saving book failed', {
           extensions: {
@@ -140,8 +210,6 @@ const resolvers = {
           }
         })
       }
-
-      return book.populate('author')
     },
     editAuthor: async (root, args) => {
       const author = await Author.findOne({ name: args.name })
@@ -200,38 +268,69 @@ const resolvers = {
         id: user._id,
       }
     
-      console.log('Creating token with secret:', JWT_SECRET) // temporary debug log
       return { value: jwt.sign(userForToken, JWT_SECRET) }
     },
-  }
+  },
+  Subscription: {
+    bookAdded: {
+      subscribe: () => pubsub.asyncIterator('BOOK_ADDED')
+    },
+  },
 }
 
-const server = new ApolloServer({
-  typeDefs,
-  resolvers,
-  introspection: true,
-  csrfPrevention: false,
-  cache: 'bounded'
-})
+const start = async () => {
+  const app = express()
+  const httpServer = http.createServer(app)
 
-startStandaloneServer(server, {
-  listen: { port: 4000 },
-  context: async ({ req }) => {
-    const auth = req ? req.headers.authorization : null
-    if (auth && auth.startsWith('Bearer ')) {
-      try {
-        const decodedToken = jwt.verify(
-          auth.substring(7), 
-          process.env.JWT_SECRET
-        )
-        const currentUser = await User.findById(decodedToken.id)
-        return { currentUser }
-      } catch (error) {
-        console.log('Token verification failed:', error.message)
-        return null
-      }
-    }
-  },
-}).then(({ url }) => {
-  console.log(`Server ready at ${url}`)
-})
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    path: '/',
+  })
+
+  const schema = makeExecutableSchema({ typeDefs, resolvers })
+  const serverCleanup = useServer({ schema }, wsServer)
+
+  const server = new ApolloServer({
+    schema,
+    plugins: [
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await serverCleanup.dispose();
+            },
+          };
+        },
+      },
+    ],
+  })
+
+  await server.start()
+
+  app.use(
+    '/',
+    cors(),
+    express.json(),
+    expressMiddleware(server, {
+      context: async ({ req }) => {
+        const auth = req ? req.headers.authorization : null
+        if (auth && auth.startsWith('Bearer ')) {
+          const decodedToken = jwt.verify(
+            auth.substring(7), JWT_SECRET
+          )
+          const currentUser = await User.findById(decodedToken.id)
+          return { currentUser }
+        }
+      },
+    }),
+  )
+
+  const PORT = 4000
+
+  httpServer.listen(PORT, () => 
+    console.log(`Server is now running on http://localhost:${PORT}`)
+  )
+}
+
+start()

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { useQuery } from '@apollo/client'
-import { ALL_BOOKS, ME } from '../queries'
+import { useQuery, useSubscription } from '@apollo/client'
+import { ALL_BOOKS, ME, BOOK_ADDED } from '../queries'
 
 const Books = () => {
   const [selectedGenre, setSelectedGenre] = useState(null)
@@ -8,6 +8,52 @@ const Books = () => {
     variables: { genre: selectedGenre }
   })
   const userResult = useQuery(ME)
+
+  const updateCache = (cache, addedBook) => {
+    cache.updateQuery(
+      { 
+        query: ALL_BOOKS,
+        variables: { genre: selectedGenre }
+      }, 
+      (data) => {
+        if (!data) {
+          return { allBooks: [addedBook] }
+        }
+        if (
+          !selectedGenre || 
+          addedBook.genres.includes(selectedGenre)
+        ) {
+          return {
+            allBooks: [...data.allBooks, addedBook]
+          }
+        }
+        return data
+      }
+    )
+
+    cache.updateQuery(
+      { 
+        query: ALL_BOOKS,
+        variables: { genre: null }
+      }, 
+      (data) => {
+        if (!data) {
+          return { allBooks: [addedBook] }
+        }
+        return {
+          allBooks: [...data.allBooks, addedBook]
+        }
+      }
+    )
+  }
+
+  useSubscription(BOOK_ADDED, {
+    onData: ({ data, client }) => {
+      const addedBook = data.data.bookAdded
+      window.alert(`New book added: ${addedBook.title}`)
+      updateCache(client.cache, addedBook)
+    }
+  })
 
   useEffect(() => {
     if (userResult.data?.me) {
